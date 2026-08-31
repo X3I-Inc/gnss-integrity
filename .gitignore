@@ -44,3 +44,15 @@ htmlcov/
 # Project-specific: raw datasets and logs shouldn't be committed
 data/raw/
 *.log
+
+# Raw TEXBAT recordings (large binaries). The small derived features.csv
+# under data/texbat/<scenario>/ are kept in-tree so the detectors are
+# reproducible without re-downloading the raw .mat files.
+data/texbat/**/*.mat
+
+# Vendored / unrelated sub-project checked out inside the working tree
+TinyMLGNSS/
+
+# Generated analysis plots written to the repo root by the *validate /
+# plot_* scripts (regenerable; not source)
+/*.png
