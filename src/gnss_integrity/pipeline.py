@@ -130,6 +130,16 @@ class PipelineConfig:
     # perfect detector stops helping (drift catches up with the bias).
     pre_attack_s: float = 30.0
     post_attack_s: float = 45.0
+    # Optional, off-by-default: run a *bounded* attack of this many seconds
+    # followed by ``recovery_s`` of clean GPS, instead of "spoofed from
+    # onset to end of run". This exists to isolate the "sustained attack,
+    # no recovery" failure mode -- see the Phase 4 findings. The recovery
+    # segment replays the real record's *clean* leading epochs (TEXBAT has
+    # no real post-attack clean data), which lets the flag stream clear
+    # and tests whether the EKF re-anchors once trust is restored. When
+    # ``None`` (default) the behaviour above is unchanged.
+    attack_duration_s: float | None = None
+    recovery_s: float = 45.0
     flagged_trust_weight: float = DEFAULT_FLAGGED_TRUST_WEIGHT
     seed: int = 42
 
@@ -146,6 +156,8 @@ class PipelineResult:
     oracle_series: np.ndarray     # (M,) ground-truth spoof label at each fix
     trust_series: np.ndarray      # (M,) trust weight used (real detector) per fix
     attack_window: tuple[float, float]   # (start, end) in synthetic time
+    recovery_window: tuple[float, float] | None = None  # set only for a
+    # bounded attack: (attack_end, run_end), a clean-GPS re-anchor period
     metrics: dict = field(default_factory=dict)
 
 
@@ -285,11 +297,22 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
     rel_t, flags, oracle_flags, attack_start = _detector_flag_stream(cfg)
     scenario_dur = float(rel_t[-1])
 
-    # Balanced slice: clean run-up, bounded attack, clean tail.
     w_start = max(0.0, attack_start - cfg.pre_attack_s)
-    w_end = min(scenario_dur, attack_start + cfg.post_attack_s)
-    syn_dur = w_end - w_start
-    attack_window = (attack_start - w_start, w_end - w_start)
+    if cfg.attack_duration_s is None:
+        # Default: degraded GPS from onset to the end of the run (the
+        # honest analogue of TEXBAT's real, non-terminating attacks).
+        w_end = min(scenario_dur, attack_start + cfg.post_attack_s)
+        syn_dur = w_end - w_start
+        attack_window = (attack_start - w_start, w_end - w_start)
+        recovery_start: float | None = None
+    else:
+        # Bounded attack + a synthetic clean-GPS recovery tail. Used to
+        # isolate the "sustained attack, no recovery" failure mode.
+        atk_len = float(cfg.attack_duration_s)
+        attack_window = (cfg.pre_attack_s, cfg.pre_attack_s + atk_len)
+        recovery_start = cfg.pre_attack_s + atk_len
+        syn_dur = recovery_start + cfg.recovery_s
+    recovery_window = None if recovery_start is None else (recovery_start, syn_dur)
 
     sim_cfg = _replace(SimConfig(), duration_s=syn_dur, seed=cfg.seed)
     result = simulate(
@@ -301,11 +324,18 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
     gt = result.ground_truth
     truth = gt.position()
 
-    # Align both flag streams onto synthetic time (0 == w_start).
-    src_t = rel_t - w_start
+    # Map a synthetic timestamp back to a real-scenario timestamp so the
+    # detector flags can be looked up. This is exactly ``w_start + t`` in
+    # the default case; in the bounded case the recovery segment replays
+    # the real record's clean leading epochs (from real t = 0), so the
+    # flag stream clears just as the synthetic fault does.
+    def _real_time(t_syn: float) -> float:
+        if recovery_start is not None and t_syn >= recovery_start:
+            return t_syn - recovery_start
+        return w_start + t_syn
 
     def _nearest(arr, t_syn):
-        return int(arr[int(np.argmin(np.abs(src_t - t_syn)))])
+        return int(arr[int(np.argmin(np.abs(rel_t - _real_time(t_syn))))])
 
     def trust_real(t_syn):
         return flag_to_trust_weight(_nearest(flags, t_syn), cfg.flagged_trust_weight)
@@ -327,7 +357,8 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
     tt = gt.t
     in_attack = (tt >= atk0) & (tt <= atk1)
     pre_attack = tt < atk0
-    gps_in_attack = fix_t >= atk0
+    post_recovery = tt > atk1  # all-False (-> RMSE nan) unless a bounded attack
+    gps_in_attack = (fix_t >= atk0) & (fix_t <= atk1)
     gps_pre_attack = fix_t < atk0
 
     def _row(fused):
@@ -335,6 +366,7 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
             "overall": _rmse(fused, truth),
             "pre": _rmse(fused, truth, pre_attack),
             "attack": _rmse(fused, truth, in_attack),
+            "recovery": _rmse(fused, truth, post_recovery),
         }
 
     metrics = {
@@ -348,7 +380,10 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
         if gps_in_attack.any() else float("nan"),
         "detector_fp_pre_attack": float(flag_series[gps_pre_attack].mean())
         if gps_pre_attack.any() else float("nan"),
+        "detector_fp_recovery": float(flag_series[fix_t > atk1].mean())
+        if (fix_t > atk1).any() else float("nan"),
         "n_gps_fixes": int(len(fix_t)),
+        "bounded_attack": cfg.attack_duration_s is not None,
     }
 
     return PipelineResult(
@@ -362,6 +397,7 @@ def run_pipeline(cfg: PipelineConfig | None = None) -> PipelineResult:
         oracle_series=oracle_series,
         trust_series=fix_w,
         attack_window=attack_window,
+        recovery_window=recovery_window,
         metrics=metrics,
     )
 
@@ -375,19 +411,29 @@ def print_report(res: PipelineResult) -> None:
     print("\n=== Phase 4: integrity-aware fusion ===")
     print(f"scenario         : {m['scenario']}  (real {m['detector']} flags)")
     print(f"synthetic run    : {res.t[-1]:.0f} s, {m['n_gps_fixes']} GPS fixes")
-    print(f"attack window    : {a0:.0f}-{a1:.0f} s  (synthetic degraded GPS,"
-          f" co-timed with the real scenario's documented attack)")
+    if res.recovery_window is not None:
+        r0, r1 = res.recovery_window
+        print(f"attack window    : {a0:.0f}-{a1:.0f} s  (bounded synthetic degraded GPS)")
+        print(f"recovery window  : {r0:.0f}-{r1:.0f} s  (clean GPS; flag stream "
+              f"replays real clean epochs -- synthetic stand-in, TEXBAT has "
+              f"no real post-attack clean data)")
+    else:
+        print(f"attack window    : {a0:.0f}-{a1:.0f} s  (synthetic degraded GPS to "
+              f"end of run, co-timed with the real scenario's documented attack)")
     print(f"flag -> trust    : anomalous fix trusted at weight "
           f"{m['flagged_trust_weight']:g} (else 1.0)")
     print(f"real detector    : recall in attack = {m['detector_recall_in_attack']:.2f}, "
           f"false-positive rate before attack = {m['detector_fp_pre_attack']:.2f}")
     print()
 
-    hdr = f"{'RMSE (m)':16} {'naive':>9} {'integ (real)':>14} {'integ (oracle)':>16}"
+    rows = [("overall", "overall"), ("pre-attack", "pre"), ("in attack", "attack")]
+    if np.isfinite(m["naive"]["recovery"]):
+        rows.append(("post-attack recov", "recovery"))
+    hdr = f"{'RMSE (m)':18} {'naive':>9} {'integ (real)':>14} {'integ (oracle)':>16}"
     print(hdr)
     print("-" * len(hdr))
-    for label, key in (("overall", "overall"), ("pre-attack", "pre"), ("in attack", "attack")):
-        print(f"{label:16} {m['naive'][key]:9.2f} {m['integrity_real'][key]:14.2f} "
+    for label, key in rows:
+        print(f"{label:18} {m['naive'][key]:9.2f} {m['integrity_real'][key]:14.2f} "
               f"{m['integrity_oracle'][key]:16.2f}")
     print()
 
@@ -410,6 +456,17 @@ def print_report(res: PipelineResult) -> None:
 
     _verdict("integrity (real detector)  ", r_atk)
     _verdict("integrity (oracle detector)", o_atk)
+
+    if np.isfinite(m["naive"]["recovery"]):
+        n_rec = m["naive"]["recovery"]
+        r_rec = m["integrity_real"]["recovery"]
+        tag = ("re-anchors: BETTER than naive" if r_rec < 0.95 * n_rec
+               else "re-anchors: ~equal to naive" if r_rec <= 1.05 * n_rec
+               else "re-anchors: still worse than naive")
+        print(f"  recovery window -- {tag} ({r_rec:.1f} vs {n_rec:.1f} m). "
+              f"A finite, bounded recovery number here means the EKF does "
+              f"re-lock onto GPS once trust is restored.")
+
     print("\n  Read: the oracle row is the ceiling the wiring can reach; the gap "
           "\n  between it and the real-detector row is pure detector quality "
           "\n  (detection latency + false positives).")
@@ -428,6 +485,9 @@ def make_plot(res: PipelineResult, out_path: str) -> None:
     )
 
     ax_err.axvspan(a0, a1, color="red", alpha=0.10, label="attack window (degraded GPS)")
+    if res.recovery_window is not None:
+        ax_err.axvspan(*res.recovery_window, color="green", alpha=0.07,
+                       label="recovery window (clean GPS)")
     ax_err.plot(t, err_naive, color="#1f77b4", linewidth=1.3,
                 label="naive fusion (GPS always trusted)")
     ax_err.plot(t, err_real, color="#2ca02c", linewidth=1.6,
@@ -443,6 +503,8 @@ def make_plot(res: PipelineResult, out_path: str) -> None:
 
     # Trust-weight strip: makes detector latency and false positives visible.
     ax_w.axvspan(a0, a1, color="red", alpha=0.10)
+    if res.recovery_window is not None:
+        ax_w.axvspan(*res.recovery_window, color="green", alpha=0.07)
     ax_w.step(res.gps_t, res.trust_series, where="post", color="#2ca02c", linewidth=1.2)
     flagged = res.flag_series == 1
     ax_w.scatter(res.gps_t[flagged], res.trust_series[flagged], s=16,
@@ -480,6 +542,13 @@ if __name__ == "__main__":
                         help="synthetic trajectory profile")
     parser.add_argument("--flagged-trust-weight", type=float,
                         default=DEFAULT_FLAGGED_TRUST_WEIGHT)
+    parser.add_argument("--attack-duration", type=float, default=None,
+                        help="if set, run a BOUNDED attack of this many seconds "
+                             "followed by --recovery seconds of clean GPS "
+                             "(default: attack runs to end of the synthetic run)")
+    parser.add_argument("--recovery", type=float, default=45.0,
+                        help="clean-GPS recovery seconds after a bounded attack "
+                             "(only used with --attack-duration)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("-o", "--output", default="pipeline_integrity_vs_naive.png")
     args = parser.parse_args()
@@ -490,6 +559,8 @@ if __name__ == "__main__":
         contamination=args.contamination,
         trajectory_kind=args.kind,
         flagged_trust_weight=args.flagged_trust_weight,
+        attack_duration_s=args.attack_duration,
+        recovery_s=args.recovery,
         seed=args.seed,
     )
     run(cfg, args.output)

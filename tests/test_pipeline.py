@@ -6,13 +6,17 @@ Covers:
   * an end-to-end smoke test that the pipeline runs and returns
     consistent, finite output,
   * the invariant that with a *perfect* (oracle) detector, integrity-
-    aware fusion is no worse than naive fusion through the attack, and
-  * a test that pins the current, honest Phase 4 finding: with the real
-    IsolationForest detector, integrity-aware fusion is actually *worse*
-    than naive in-window on ds2 -- because of the detector's detection
-    latency and pre-attack false positives, not a wiring bug. If a future
-    detector improvement flips this, that test is meant to fail and be
-    updated.
+    aware fusion is no worse than naive fusion through the attack,
+  * a test that pins the current, honest Phase 4 finding on the default
+    (*sustained*, no-recovery) scenario: with the real IsolationForest
+    detector, integrity-aware fusion is actually *worse* than naive
+    in-window on ds2 -- detection latency + pre-attack false positives,
+    not a wiring bug, and
+  * the Phase-4.1 follow-up: on a *bounded* attack followed by a
+    clean-GPS recovery period, that negative result largely reverses --
+    the EKF re-anchors once trust is restored and overall RMSE returns to
+    parity-or-better. This confirms "sustained attack, no recovery" was
+    the dominant cause, so both results are pinned here side by side.
 
 These use the committed TEXBAT feature CSVs (small, ~120 KB each) and
 train a fast IsolationForest, so no network / large data is needed.
@@ -55,8 +59,16 @@ def test_flag_to_trust_weight_custom_weight():
 
 @pytest.fixture(scope="module")
 def ds2_result() -> PipelineResult:
-    # Default config == ds2, isolation_forest, bounded attack window.
+    # Default config == ds2, isolation_forest, sustained attack (degraded
+    # GPS from onset to the end of the run -- no recovery period).
     return run_pipeline(PipelineConfig())
+
+
+@pytest.fixture(scope="module")
+def ds2_bounded_result() -> PipelineResult:
+    # Bounded attack (25 s) + a 45 s clean-GPS recovery tail. Same
+    # everything else as the default.
+    return run_pipeline(PipelineConfig(attack_duration_s=25.0, recovery_s=45.0))
 
 
 def test_pipeline_runs_and_output_is_consistent(ds2_result: PipelineResult):
@@ -117,12 +129,13 @@ def test_real_detector_integrity_currently_underperforms(ds2_result: PipelineRes
     reckoning on a bad velocity drifts faster than the spoof bias itself.
     Pre-attack false positives add to the damage.
 
-    This is not a wiring bug -- the oracle test passes, and other configs
-    (e.g. --scenario ds3 --kind line) come out ahead. It is a real,
-    scenario-dependent result about coupling a raw binary flag straight
-    into the trust weight. If a detector/mapping improvement makes the
-    default come out >= naive, this test SHOULD fail -- update it and the
-    Phase 4 write-up together.
+    This is not a wiring bug -- the oracle test passes, other configs
+    (e.g. --scenario ds3 --kind line) come out ahead, and the *dominant*
+    cause is the sustained/no-recovery attack profile: see
+    ``test_bounded_attack_recovery_reanchors``, where a bounded attack
+    with a recovery period brings the overall RMSE back to parity. If a
+    detector/mapping improvement makes the default come out >= naive, this
+    test SHOULD fail -- update it and the Phase 4 write-up together.
     """
     m = ds2_result.metrics
     naive_atk = m["naive"]["attack"]
@@ -143,6 +156,75 @@ def test_pipeline_deterministic():
     assert a.metrics["integrity_real"]["overall"] == pytest.approx(
         b.metrics["integrity_real"]["overall"]
     )
+
+
+# --- bounded attack + recovery (Phase 4.1) ---------------------------
+
+
+def test_bounded_attack_is_off_by_default(ds2_result: PipelineResult):
+    """The bounded-attack knob must not touch the default behaviour."""
+    assert PipelineConfig().attack_duration_s is None
+    assert ds2_result.recovery_window is None
+    # no recovery segment -> the recovery RMSE row is NaN, not a number
+    assert not np.isfinite(ds2_result.metrics["naive"]["recovery"])
+    # default attack still runs to the end of the synthetic run
+    _a0, a1 = ds2_result.attack_window
+    assert a1 == pytest.approx(ds2_result.t[-1], abs=1.0 / 50.0)
+
+
+def test_bounded_attack_has_a_recovery_window(ds2_bounded_result: PipelineResult):
+    r = ds2_bounded_result
+    assert r.recovery_window is not None
+    r0, r1 = r.recovery_window
+    a0, a1 = r.attack_window
+    assert a0 == pytest.approx(30.0) and a1 == pytest.approx(55.0)
+    assert r0 == pytest.approx(55.0) and r1 == pytest.approx(100.0)
+    for key in ("naive", "integrity_real", "integrity_oracle"):
+        assert np.isfinite(r.metrics[key]["recovery"])
+    # detector flags must genuinely clear during the replayed-clean recovery
+    assert r.metrics["detector_fp_recovery"] == pytest.approx(0.0, abs=0.05)
+
+
+def test_bounded_attack_recovery_reanchors(ds2_bounded_result: PipelineResult):
+    """The headline Phase 4.1 result: with a bounded attack + recovery, the
+    real-detector integrity filter re-anchors to GPS once trust is
+    restored, and overall RMSE is back to parity-or-better vs naive --
+    unlike the sustained-attack default, where it is ~23% worse.
+    """
+    m = ds2_bounded_result.metrics
+    naive, real = m["naive"], m["integrity_real"]
+
+    # 1. it re-locks onto GPS in the recovery window -- in fact better than
+    #    naive there (naive is still shedding the bias it chased).
+    assert real["recovery"] < naive["recovery"]
+
+    # 2. overall RMSE is no longer a clear loss -- parity within 10%.
+    assert real["overall"] <= 1.10 * naive["overall"]
+
+    # 3. the oracle still shows the ceiling: clearly better in-attack.
+    assert m["integrity_oracle"]["attack"] < 0.9 * naive["attack"]
+
+    # 4. HONEST residual: a bounded attack does NOT fully fix the
+    #    in-attack shortfall (causes 1-2 -- latency + false positives --
+    #    still cost something). This is expected; pin it so a real
+    #    improvement here is noticed.
+    assert real["attack"] >= naive["attack"]
+
+
+def test_bounded_recovery_shrinks_the_real_vs_naive_gap(
+    ds2_result: PipelineResult, ds2_bounded_result: PipelineResult
+):
+    """Direct evidence that "sustained, no recovery" was the dominant
+    cause: the real-vs-naive in-attack RMSE ratio is markedly closer to
+    1.0 once a recovery period exists."""
+    def ratio(res: PipelineResult) -> float:
+        m = res.metrics
+        return m["integrity_real"]["attack"] / m["naive"]["attack"]
+
+    sustained_ratio = ratio(ds2_result)      # ~1.23 (23% worse)
+    bounded_ratio = ratio(ds2_bounded_result)  # ~1.10 (10% worse)
+    assert sustained_ratio > 1.15
+    assert bounded_ratio < sustained_ratio - 0.05
 
 
 def test_lower_trust_weight_rejects_harder(ds2_result: PipelineResult):
