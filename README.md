@@ -1,6 +1,23 @@
 # gnss-integrity
 
-GPS receivers report a position even when that position is wrong — multipath, jamming, and spoofing all degrade signal quality silently, with no warning built in. `gnss_integrity` watches raw signal-quality features in real time and uses ML, trained only on clean/nominal conditions, to flag when the current signal doesn't match "normal." That flag feeds into a GPS+IMU sensor fusion filter (EKF), so the filter automatically trusts GPS less exactly when it shouldn't. The result isn't just a position — it's a position plus an integrity flag saying how much to trust it right now.
+**A GPS integrity toolkit: detect spoofing/jamming from raw signal-quality
+features, then fuse GPS with IMU so the filter trusts GPS less exactly when
+it shouldn't.**
+
+GPS receivers report a position even when that position is wrong — multipath,
+jamming, and spoofing all degrade signal quality silently, with no warning
+built in. `gnss_integrity` watches raw signal-quality features in real time
+and uses ML, trained only on clean/nominal conditions, to flag when the
+current signal doesn't match "normal." That flag feeds into a GPS+IMU sensor
+fusion filter (EKF), so the filter automatically down-weights GPS during
+suspect epochs. The result isn't just a position — it's a position plus an
+integrity flag saying how much to trust it right now.
+
+> **Project status: research prototype, under active development.** Phases 0–3
+> (data loaders, detectors, EKF fusion) are complete and tested. Phase 4 (the
+> detector → EKF integration) is wired and characterised but the end-to-end
+> win is not yet demonstrated with a *real* detector — see
+> [Status](#status) for the honest breakdown.
 
 ## Architecture
 
@@ -22,7 +39,7 @@ GPS receivers report a position even when that position is wrong — multipath, 
                           v
               anomaly flag  (0 = clean, 1 = anomalous)
                           |
-                          v   pipeline.py  (Phase 4, wired -- result mixed)
+                          v   pipeline.py  (Phase 4, wired)
                   flag -> GPS trust_weight
                           |
                           v
@@ -33,15 +50,17 @@ GPS receivers report a position even when that position is wrong — multipath, 
               fused position  (+ integrity flag)
 ```
 
-`pipeline.py` connects the two: the detector's per-epoch flag is mapped to a
-`trust_weight` and fed to `ekf.update_gps()`, replacing the hand-set constant
-`fuse/validate.py` used. With a *perfect* (oracle) detector this beats naive
-"always trust GPS" fusion through a spoofing window; with the current Phase 2
-IsolationForest it does **not** yet — detection latency and false positives
-make it scenario-dependent and, on the default ds2 case, worse than naive.
-See the Phase 4 status note below.
+`pipeline.py` connects the two halves: the detector's per-epoch flag is
+mapped to a `trust_weight` and fed to `ekf.update_gps()`, replacing the
+hand-set constant `fuse/validate.py` used. With a *perfect* (oracle) detector
+this beats naive "always trust GPS" fusion through a spoofing window. With
+the current Phase 2 IsolationForest the result is scenario-dependent: worse
+than naive on a sustained attack with no GPS recovery, back to parity or
+better once a recovery period exists. See [Status](#status).
 
 ## Installation
+
+Python ≥ 3.10.
 
 ```bash
 pip install -e .
@@ -52,6 +71,87 @@ For development (tests, linting):
 ```bash
 pip install -e ".[dev]"
 ```
+
+Dependencies: `numpy`, `scipy`, `pandas`, `scikit-learn`, `matplotlib`,
+`pynmea2`. The autoencoder detector additionally needs `tensorflow`
+(not a declared dependency — install it separately if you want that path;
+the Isolation Forest detector works without it).
+
+## Usage
+
+**Parse a TEXBAT scenario into per-epoch features:**
+
+```bash
+python -m gnss_integrity.data.texbat_loader \
+    data/texbat/ds2/channel.mat data/texbat/ds2/navsol.mat \
+    -o data/texbat/ds2/features.csv
+```
+
+**Train + evaluate a detector on TEXBAT spoofing scenarios:**
+
+```bash
+python -m gnss_integrity.detect.isolation_forest \
+    --train data/texbat/cleanStatic/features.csv \
+    --eval  data/texbat/ds2/features.csv data/texbat/ds7/features.csv
+```
+
+**Phase 3 — validate the EKF on a synthetic trajectory with a GPS dropout:**
+
+```bash
+python -m gnss_integrity.fuse.validate -o fuse_validation.png
+```
+
+Prints RMSE for fused-vs-raw-GPS and saves a ground-truth / raw-GPS / fused
+plot with the dropout window shaded.
+
+**Phase 4 — detector-driven integrity-aware fusion (naive vs integrity-aware
+vs oracle):**
+
+```bash
+# sustained attack (spoofed to end of run, matches real TEXBAT)
+python -m gnss_integrity.pipeline --scenario ds2 -o pipeline.png
+
+# bounded attack + a clean-GPS recovery period
+python -m gnss_integrity.pipeline --scenario ds2 \
+    --attack-duration 25 --recovery 45 -o pipeline_bounded.png
+```
+
+## Repository layout
+
+```
+src/gnss_integrity/
+  data/      nmea_loader.py, texbat_loader.py   -> per-epoch feature CSVs
+  detect/    isolation_forest.py, autoencoder.py -> 0/1 anomaly flag per epoch
+  fuse/      ekf.py            5-state GPS/IMU Extended Kalman Filter
+             trajectory_sim.py synthetic ground-truth + IMU + GPS generator
+             validate.py       Phase 3 CLI (EKF vs raw GPS through a dropout)
+  pipeline.py                  Phase 4 CLI (detector flag -> EKF trust weight)
+data/texbat/<scenario>/        derived features.csv (raw .mat not committed)
+tests/                         pytest suite (test_fuse.py, test_pipeline.py)
+scripts/                       diagnostic plotting helpers
+```
+
+## Data
+
+Detector training/evaluation uses **TEXBAT** (Texas Spoofing Test Battery),
+the public GPS spoofing dataset from the UT Austin Radionavigation Laboratory
+— scenarios `cleanStatic`, `ds2`, `ds3`, `ds7`. Only the small derived
+per-epoch `features.csv` files are committed; the multi-MB raw `channel.mat` /
+`navsol.mat` recordings are not — download them from UT Austin and run
+`texbat_loader.py` to regenerate.
+
+There is no real paired GPS+IMU dataset in this project (TEXBAT is GPS-only),
+so the EKF and the Phase 4 integration are validated on **synthetic
+trajectories** with synthetic IMU and synthetic GPS faults, against exact
+ground truth. See `fuse/trajectory_sim.py`.
+
+## Testing
+
+```bash
+pytest tests/ -v
+```
+
+23 tests, all synthetic (no network, no large data), typically ~8 s.
 
 ## Status
 
@@ -98,3 +198,7 @@ Under active development.
     wiring one.
 - **Phase 5 — CI.** Not started. Test suite (`pytest tests/`, 23 tests)
   is CI-ready — `pip install -e ".[dev]"` is the only setup.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
