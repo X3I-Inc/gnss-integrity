@@ -1,23 +1,61 @@
 # gnss-integrity
 
-**A GPS integrity toolkit: detect spoofing/jamming from raw signal-quality
-features, then fuse GPS with IMU so the filter trusts GPS less exactly when
-it shouldn't.**
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![status](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#status)
 
-GPS receivers report a position even when that position is wrong — multipath,
-jamming, and spoofing all degrade signal quality silently, with no warning
-built in. `gnss_integrity` watches raw signal-quality features in real time
-and uses ML, trained only on clean/nominal conditions, to flag when the
-current signal doesn't match "normal." That flag feeds into a GPS+IMU sensor
-fusion filter (EKF), so the filter automatically down-weights GPS during
-suspect epochs. The result isn't just a position — it's a position plus an
-integrity flag saying how much to trust it right now.
+**gnss-integrity turns a GPS fix into a GPS fix *plus* an integrity flag** — a
+live, per-epoch estimate of how much to trust the position right now. GPS
+receivers report a position even when it's wrong: multipath, jamming, and
+spoofing degrade the signal silently, with no built-in warning.
+
+This toolkit watches raw signal-quality features, uses ML trained only on
+clean/nominal conditions to flag when the signal stops looking "normal," and
+feeds that flag into a GPS+IMU Extended Kalman Filter so the filter
+automatically down-weights GPS exactly when it shouldn't be trusted. The
+output is a fused position *and* an integrity flag, not just a position.
 
 > **Project status: research prototype, under active development.** Phases 0–3
 > (data loaders, detectors, EKF fusion) are complete and tested. Phase 4 (the
 > detector → EKF integration) is wired and characterised but the end-to-end
 > win is not yet demonstrated with a *real* detector — see
 > [Status](#status) for the honest breakdown.
+
+## Example
+
+Everything here runs against data already in this repo — no hardware, no
+downloads. Run the integrity-aware fusion pipeline on TEXBAT scenario `ds2`
+with a bounded spoofing attack followed by a GPS-recovery window:
+
+```bash
+python -m gnss_integrity.pipeline --scenario ds2 --attack-duration 25 --recovery 45 -o pipeline_bounded.png
+```
+
+It trains an Isolation Forest on clean data, runs it on the real `ds2`
+spoofing scenario to get a genuine per-epoch anomaly-flag stream, then drives
+three EKFs over a synthetic trajectory whose GPS is corrupted during the
+attack window: **naive** (always trust GPS), **integrity-aware** (trust weight
+from the real detector), and **oracle** (trust weight from ground truth). It
+prints a per-window RMSE table and saves a position-error-vs-time plot with
+the attack and recovery windows shaded.
+
+What the plot shows, on this scenario:
+
+| RMSE vs truth (m)            | naive | integrity-aware (real) | oracle |
+|-----------------------------|-------|------------------------|--------|
+| during the attack (30–55 s) | 36.7  | 40.3                   | 21.3   |
+| recovery window (55–100 s)  | 15.1  | **9.6**                | 5.2    |
+
+During the attack itself the real-detector line is *slightly worse* than
+naive: the Isolation Forest takes ~5 s to lock on (recall 0.73 in-window),
+and those first spoofed-but-trusted fixes corrupt the filter's velocity. The
+win shows up in the **recovery window** — once trust is restored the
+integrity-aware estimate re-anchors ~1.6× closer to truth than naive, which
+is still unwinding the bias it chased. The oracle (zero-latency) filter is
+best throughout and marks the ceiling the integration could reach with a
+better detector. That latency cost is the honest caveat detailed in
+[Status](#status): on a *sustained* attack with no recovery period it makes
+integrity-aware fusion **~23 % worse than naive** on `ds2`.
 
 ## Architecture
 
@@ -58,31 +96,40 @@ the current Phase 2 IsolationForest the result is scenario-dependent: worse
 than naive on a sustained attack with no GPS recovery, back to parity or
 better once a recovery period exists. See [Status](#status).
 
+## Runs on / requires
+
+**Software — the detector / EKF / pipeline work, today.** Any OS, Python ≥ 3.10,
+CPU only, no GPU. Core dependencies (`numpy`, `scipy`, `pandas`,
+`scikit-learn`, `matplotlib`, `pynmea2`) are all pulled in by
+`pip install -e .`. The TEXBAT-based detector, the EKF, and the Phase 4
+pipeline run entirely against the `features.csv` files committed in this repo
+— no hardware needed. The **autoencoder** detector path additionally needs
+**`tensorflow`**, which is *not* a declared dependency: install it yourself
+(`pip install tensorflow`) if you want that path; the Isolation Forest
+detector works without it.
+
+**Recording your own data (optional).** A **GY-NEO6MV2** (u-blox NEO-6M) GPS
+module → **ESP32** UART passthrough → `scripts/nmea_logger.py` reading the
+ESP32 over **USB serial at 115200 baud**. Needs `pyserial`
+(`pip install -e ".[hardware]"`). Any receiver that streams NMEA over a
+serial port works too.
+
+**Planned — not in this repo.** Quantized, on-device inference of the detector
+on **ESP32 / ESP32-S3** within a ~520 KB SRAM budget (Phase 7). This is
+roadmap, gated on hardware availability — nothing runs on-device today.
+
 ## Installation
 
 Python ≥ 3.10.
 
 ```bash
-pip install -e .
+pip install -e .              # core: detector + EKF + pipeline
+pip install -e ".[dev]"       # + pytest, ruff
+pip install -e ".[hardware]"  # + pyserial, for scripts/nmea_logger.py
 ```
 
-For development (tests, linting):
-
-```bash
-pip install -e ".[dev]"
-```
-
-To record your own NMEA logs from a serial GPS receiver (see
-[Usage](#usage)), install the `hardware` extra (adds `pyserial`):
-
-```bash
-pip install -e ".[hardware]"
-```
-
-Dependencies: `numpy`, `scipy`, `pandas`, `scikit-learn`, `matplotlib`,
-`pynmea2`. The autoencoder detector additionally needs `tensorflow`
-(not a declared dependency — install it separately if you want that path;
-the Isolation Forest detector works without it).
+See [Runs on / requires](#runs-on--requires) for the `tensorflow` autoencoder
+caveat.
 
 ## Usage
 
@@ -227,6 +274,13 @@ Under active development.
     wiring one.
 - **Phase 5 — CI.** Not started. Test suite (`pytest tests/`, 23 tests)
   is CI-ready — `pip install -e ".[dev]"` is the only setup.
+- **Phase 6 — detector hardening.** Planned. Cut detection latency and the
+  pre-attack false-positive rate, and replace the binary flag → trust-weight
+  step with a smoother score-based map — the levers the Phase 4 findings
+  point at.
+- **Phase 7 — on-device inference.** Planned, gated on hardware. Quantized
+  detector running on ESP32 / ESP32-S3 within a ~520 KB SRAM budget, fed by
+  the same NMEA feature pipeline used offline today.
 
 ## License
 
