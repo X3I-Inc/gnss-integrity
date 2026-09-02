@@ -3,7 +3,7 @@ NMEA Logger — logs raw NMEA sentences from the NEO-6M (via ESP32-S3 passthroug
 to a timestamped file, with a live per-line timestamp for later temporal-feature work.
 
 Usage:
-    python nmea_logger.py --port COM6 --baud 115200 --label clean
+    python scripts/nmea_logger.py --port COM6 --baud 115200 --label clean
 
     --port   Serial port your ESP32-S3 shows up as (check Arduino IDE Tools > Port)
     --baud   Must match Serial.begin() in the sketch (115200 in your current sketch)
@@ -25,7 +25,8 @@ try:
     import serial
 except ImportError:
     sys.exit(
-        "pyserial not installed. Run: pip install pyserial --break-system-packages"
+        'pyserial not installed. Run: pip install -e ".[hardware]" '
+        "(from the repo root), or: pip install pyserial"
     )
 
 

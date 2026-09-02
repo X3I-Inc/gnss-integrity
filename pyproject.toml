@@ -23,6 +23,9 @@ dev = [
     "pytest",
     "ruff",
 ]
+hardware = [
+    "pyserial",  # scripts/nmea_logger.py: live NMEA capture over serial
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

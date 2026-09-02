@@ -72,6 +72,13 @@ For development (tests, linting):
 pip install -e ".[dev]"
 ```
 
+To record your own NMEA logs from a serial GPS receiver (see
+[Usage](#usage)), install the `hardware` extra (adds `pyserial`):
+
+```bash
+pip install -e ".[hardware]"
+```
+
 Dependencies: `numpy`, `scipy`, `pandas`, `scikit-learn`, `matplotlib`,
 `pynmea2`. The autoencoder detector additionally needs `tensorflow`
 (not a declared dependency — install it separately if you want that path;
@@ -116,6 +123,22 @@ python -m gnss_integrity.pipeline --scenario ds2 \
     --attack-duration 25 --recovery 45 -o pipeline_bounded.png
 ```
 
+**Record your own NMEA logs from a serial GPS receiver** (u-blox NEO-6M
+via ESP32-S3 passthrough, or any receiver that streams NMEA over serial):
+
+```bash
+python scripts/nmea_logger.py --port COM6 --baud 115200 --label clean
+```
+
+Writes `logs/nmea_<label>_<timestamp>.log`; turn it into the same
+per-epoch feature CSV as the TEXBAT path with:
+
+```bash
+python -m gnss_integrity.data.nmea_loader logs/nmea_clean_<timestamp>.log -o my_features.csv
+```
+
+Requires the `hardware` extra (`pyserial`).
+
 ## Repository layout
 
 ```
@@ -127,8 +150,11 @@ src/gnss_integrity/
              validate.py       Phase 3 CLI (EKF vs raw GPS through a dropout)
   pipeline.py                  Phase 4 CLI (detector flag -> EKF trust weight)
 data/texbat/<scenario>/        derived features.csv (raw .mat not committed)
+notebooks/                     01_clean_baseline_exploration.ipynb (clean-data EDA)
+scripts/
+  nmea_logger.py               live NMEA capture over serial (ESP32-S3 / NEO-6M)
+  plot_reconstruction_error.py autoencoder reconstruction-error diagnostic plot
 tests/                         pytest suite (test_fuse.py, test_pipeline.py)
-scripts/                       diagnostic plotting helpers
 ```
 
 ## Data
@@ -144,6 +170,9 @@ There is no real paired GPS+IMU dataset in this project (TEXBAT is GPS-only),
 so the EKF and the Phase 4 integration are validated on **synthetic
 trajectories** with synthetic IMU and synthetic GPS faults, against exact
 ground truth. See `fuse/trajectory_sim.py`.
+
+To capture your own clean/nominal NMEA data from real hardware, see
+`scripts/nmea_logger.py` (documented under [Usage](#usage)).
 
 ## Testing
 
