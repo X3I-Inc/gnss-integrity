@@ -114,9 +114,9 @@ ESP32 over **USB serial at 115200 baud**. Needs `pyserial`
 (`pip install -e ".[hardware]"`). Any receiver that streams NMEA over a
 serial port works too.
 
-**Planned — not in this repo.** Quantized, on-device inference of the detector
-on **ESP32 / ESP32-S3** within a ~520 KB SRAM budget (Phase 7). This is
-roadmap, gated on hardware availability — nothing runs on-device today.
+**Validated on real hardware.** The trained Isolation Forest has been run
+on-device on an **ESP32** reading a live GPS module: **~200 KB RAM**,
+**0.1–1 ms** per inference. See [On-device (ESP32) results](#on-device-esp32-results).
 
 ## Installation
 
@@ -221,6 +221,36 @@ ground truth. See `fuse/trajectory_sim.py`.
 To capture your own clean/nominal NMEA data from real hardware, see
 `scripts/nmea_logger.py` (documented under [Usage](#usage)).
 
+## On-device (ESP32) results
+
+The Phase 2 Isolation Forest detector was trained on clean-signal features,
+validated against real spoofing scenarios from **TEXBAT**, and then run
+on-device on an **ESP32** reading a live GPS module (same detector, no
+retraining for the port). Numbers below are from that hardware run, not
+simulation.
+
+| Metric                                   | Result       |
+|-------------------------------------------|--------------|
+| Spoofing detection latency (TEXBAT)        | 5–20 s       |
+| False positive rate on clean segments      | ~5.5 %       |
+| On-device RAM (ESP32, model + inference)   | ~200 KB      |
+| On-device inference time per epoch (ESP32) | 0.1–1 ms     |
+
+Takeaways from the hardware run:
+
+- The detector and inference loop fit comfortably inside the ESP32's SRAM
+  budget with headroom to spare, and inference is fast enough to run
+  every epoch in real time — compute was never the bottleneck.
+- The hard problems were statistical, not firmware: the anomaly threshold
+  trades detection latency against false-alarm rate, and that trade-off
+  was worked out **empirically** — the threshold is not yet *derived*
+  from the underlying statistics, which is the open problem Phase 6
+  targets.
+- Sustained spoofing attacks and recoverable ones drive the filter very
+  differently (see the Phase 4 findings under [Status](#status)), so a
+  single fixed threshold is a compromise between the two rather than
+  optimal for either.
+
 ## Testing
 
 ```bash
@@ -278,9 +308,12 @@ Under active development.
   pre-attack false-positive rate, and replace the binary flag → trust-weight
   step with a smoother score-based map — the levers the Phase 4 findings
   point at.
-- **Phase 7 — on-device inference.** Planned, gated on hardware. Quantized
-  detector running on ESP32 / ESP32-S3 within a ~520 KB SRAM budget, fed by
-  the same NMEA feature pipeline used offline today.
+- **Phase 7 — on-device inference.** *Validated on real hardware.* The
+  trained Isolation Forest runs on an ESP32 reading a live GPS module:
+  ~200 KB RAM, 0.1–1 ms inference per epoch — well inside the ~520 KB SRAM
+  budget. See [On-device (ESP32) results](#on-device-esp32-results). The
+  remaining open problem is deriving the detection threshold analytically
+  instead of setting it empirically (feeds Phase 6).
 
 ## License
 
